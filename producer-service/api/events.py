@@ -1,6 +1,6 @@
 import json
 import uuid
-import datetime
+from datetime import datetime, timezone
 import pika
 import os
 import logging
@@ -48,7 +48,7 @@ def publish_event(event_type, product_id, payload):
     channel = connection.channel()
     
     event_id = str(uuid.uuid4())
-    timestamp = datetime.datetime.utcnow().isoformat()
+    timestamp = datetime.now(timezone.utc).isoformat()
     
     message = {
         'event_id': event_id,

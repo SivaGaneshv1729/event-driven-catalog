@@ -32,10 +32,14 @@ def update_search_index(product_id, payload, event_type):
             'price': str(payload.get('price', 0))
         }
     elif event_type == 'ProductUpdated':
-        if product_id in index:
-            for k, v in payload.items():
-                if k in ['name', 'description', 'price']:
-                    index[product_id][k] = str(v) if k == 'price' else v
+        if payload.get('status') == 'deleted' or payload.get('status') == 'inactive':
+            if product_id in index:
+                del index[product_id]
+        else:
+            if product_id in index:
+                for k, v in payload.items():
+                    if k in ['name', 'description', 'price']:
+                        index[product_id][k] = str(v) if k == 'price' else v
     elif event_type == 'ProductDeleted':
         if product_id in index:
             del index[product_id]

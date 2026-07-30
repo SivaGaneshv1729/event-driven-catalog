@@ -7,6 +7,8 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+import pika
+
 class ProductEventView(APIView):
     def post(self, request):
         serializer = ProductEventSerializer(data=request.data)
@@ -25,6 +27,12 @@ class ProductEventView(APIView):
                     "message": "Event published",
                     "event_id": event_id
                 }, status=status.HTTP_201_CREATED)
+            except pika.exceptions.AMQPConnectionError as e:
+                logger.error(f"RabbitMQ connection failure: {e}")
+                return Response({
+                    "status": "error",
+                    "message": "Service Unavailable: Message broker is unreachable"
+                }, status=status.HTTP_503_SERVICE_UNAVAILABLE)
             except Exception as e:
                 logger.error(f"Failed to publish event: {e}")
                 return Response({

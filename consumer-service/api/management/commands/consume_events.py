@@ -2,6 +2,7 @@ import json
 import pika
 import os
 import logging
+import time
 from django.core.management.base import BaseCommand
 from django.db import transaction
 from api.models import Product, ProcessedEvent
@@ -43,106 +44,13 @@ class Command(BaseCommand):
         })
         channel.queue_bind(exchange=EXCHANGE_NAME, queue=QUEUE_NAME, routing_key='product')
 
-        def get_retry_count(properties):
-            if not properties.headers:
-                return 0
-            if 'x-death' not in properties.headers:
-                return 0
-            # Basic retry counting based on x-death isn't perfectly straightforward without a delayed queue,
-            # but if we just reject messages without requeue, they go to DLQ immediately.
-            # To support retries, we would need a retry queue.
-            # For simplicity in this assignment, we can implement retry locally before rejecting,
-            # or if it fails locally it gets rejected and goes straight to DLQ.
-            return properties.headers.get('x-delivery-count', 0)
-
-        def process_event(ch, method, properties, body):
-            try:
-                event_data = json.loads(body)
-                event_id = event_data.get('event_id')
-                event_type = event_data.get('event_type')
-                product_id = event_data.get('product_id')
-                payload = event_data.get('payload')
-
-                if not event_id or not event_type or not product_id:
-                    logger.error("Invalid event format")
-                    ch.basic_reject(delivery_tag=method.delivery_tag, requeue=False)
-                    return
-
-                # Check Idempotency
-                if ProcessedEvent.objects.filter(event_id=event_id).exists():
-                    logger.info(f"Event {event_id} already processed. Skipping.")
-                    ch.basic_ack(delivery_tag=method.delivery_tag)
-                    return
-
-                with transaction.atomic():
-                    # Process based on event_type
-                    if event_type == 'ProductCreated':
-                        Product.objects.create(
-                            id=product_id,
-                            name=payload.get('name', ''),
-                            description=payload.get('description', ''),
-                            price=payload.get('price', 0),
-                            stock=payload.get('stock', 0),
-                            status='active'
-                        )
-                    elif event_type == 'ProductUpdated':
-                        try:
-                            product = Product.objects.select_for_update().get(id=product_id)
-                            for key, value in payload.items():
-                                if hasattr(product, key):
-                                    setattr(product, key, value)
-                            product.save()
-                        except Product.DoesNotExist:
-                            logger.error(f"Product {product_id} not found for update.")
-                            ch.basic_reject(delivery_tag=method.delivery_tag, requeue=False)
-                            return
-                    elif event_type == 'ProductDeleted':
-                        try:
-                            product = Product.objects.select_for_update().get(id=product_id)
-                            product.status = 'deleted'
-                            product.save()
-                        except Product.DoesNotExist:
-                            logger.error(f"Product {product_id} not found for deletion.")
-                            ch.basic_reject(delivery_tag=method.delivery_tag, requeue=False)
-                            return
-                    else:
-                        logger.warning(f"Unknown event type {event_type}")
-                        ch.basic_reject(delivery_tag=method.delivery_tag, requeue=False)
-                        return
-                    
-                    # Update Search Index
-                    update_search_index(product_id, payload, event_type)
-                    
-                    # Record Processed Event
-                    ProcessedEvent.objects.create(event_id=event_id)
-                
-                logger.info(f"Successfully processed event {event_id}")
-                ch.basic_ack(delivery_tag=method.delivery_tag)
-
-            except Exception as e:
-                logger.exception(f"Error processing message: {e}")
-                # Without complex delay queues, we just reject to send to DLQ on failure.
-                # Since the requirement asks for retries, we could implement a local retry loop.
-                ch.basic_reject(delivery_tag=method.delivery_tag, requeue=False)
-
-        # To implement local retries:
-        def process_with_retry(ch, method, properties, body):
-            for attempt in range(MAX_RETRIES):
-                try:
-                    process_event(ch, method, properties, body)
-                    return # Successfully processed or rejected natively
-                except Exception as e:
-                    logger.warning(f"Attempt {attempt + 1} failed: {e}")
-                    if attempt == MAX_RETRIES - 1:
-                        logger.error("Max retries reached. Sending to DLQ.")
-                        ch.basic_reject(delivery_tag=method.delivery_tag, requeue=False)
-
         # Set prefetch count to 1 for fair dispatch
         channel.basic_qos(prefetch_count=1)
+        
         # Register the consumer
         channel.basic_consume(
             queue=QUEUE_NAME,
-            on_message_callback=process_event, # Directly calling process_event as it has its own error handling
+            on_message_callback=self.process_message,
         )
 
         try:
@@ -150,3 +58,91 @@ class Command(BaseCommand):
         except KeyboardInterrupt:
             channel.stop_consuming()
         connection.close()
+
+    def process_message(self, ch, method, properties, body):
+        for attempt in range(MAX_RETRIES):
+            try:
+                self.process_event(ch, method, properties, body)
+                return  # Successfully processed or rejected natively
+            except Exception as e:
+                logger.warning(f"Attempt {attempt + 1} failed with error: {e}")
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(1)
+                else:
+                    logger.error("Max retries reached. Sending message to DLQ.")
+                    ch.basic_reject(delivery_tag=method.delivery_tag, requeue=False)
+
+    def process_event(self, ch, method, properties, body):
+        try:
+            event_data = json.loads(body)
+        except json.JSONDecodeError as e:
+            logger.error(f"Malformed JSON payload: {e}")
+            ch.basic_reject(delivery_tag=method.delivery_tag, requeue=False)
+            return
+
+        event_id = event_data.get('event_id')
+        event_type = event_data.get('event_type')
+        product_id = event_data.get('product_id')
+        payload = event_data.get('payload')
+
+        if not event_id or not event_type or not product_id or payload is None:
+            logger.error("Invalid event format: missing event_id, event_type, product_id, or payload")
+            ch.basic_reject(delivery_tag=method.delivery_tag, requeue=False)
+            return
+
+        # Check Idempotency
+        if ProcessedEvent.objects.filter(event_id=event_id).exists():
+            logger.info(f"Event {event_id} already processed. Ensuring search index is synced.")
+            update_search_index(product_id, payload, event_type)
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+            return
+
+        # DB transaction (outside of search index update)
+        with transaction.atomic():
+            if event_type == 'ProductCreated':
+                Product.objects.create(
+                    id=product_id,
+                    name=payload.get('name', ''),
+                    description=payload.get('description', ''),
+                    price=payload.get('price', 0),
+                    stock=payload.get('stock', 0),
+                    status='active'
+                )
+            elif event_type == 'ProductUpdated':
+                try:
+                    product = Product.objects.select_for_update().get(id=product_id)
+                    # Update only provided fields
+                    for key, value in payload.items():
+                        if hasattr(product, key):
+                            setattr(product, key, value)
+                    product.save()
+                except Product.DoesNotExist:
+                    logger.error(f"Product {product_id} not found for update.")
+                    ch.basic_reject(delivery_tag=method.delivery_tag, requeue=False)
+                    return
+            elif event_type == 'ProductDeleted':
+                try:
+                    product = Product.objects.select_for_update().get(id=product_id)
+                    product.status = 'deleted'
+                    product.save()
+                except Product.DoesNotExist:
+                    logger.error(f"Product {product_id} not found for deletion.")
+                    ch.basic_reject(delivery_tag=method.delivery_tag, requeue=False)
+                    return
+            else:
+                logger.warning(f"Unknown event type: {event_type}")
+                ch.basic_reject(delivery_tag=method.delivery_tag, requeue=False)
+                return
+
+            # Record Processed Event
+            ProcessedEvent.objects.create(event_id=event_id)
+
+        # Update Search Index AFTER successful DB transaction commit
+        try:
+            update_search_index(product_id, payload, event_type)
+        except Exception as index_err:
+            logger.error(f"Failed to update search index: {index_err}")
+            raise
+
+        logger.info(f"Successfully processed event {event_id}")
+        ch.basic_ack(delivery_tag=method.delivery_tag)

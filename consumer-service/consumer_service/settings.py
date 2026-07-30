@@ -75,17 +75,29 @@ WSGI_APPLICATION = 'consumer_service.wsgi.application'
 # https://docs.djangoproject.com/en/6.0/ref/settings/#databases
 
 import os
+import sys
 
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.mysql',
-        'NAME': os.environ.get('MYSQL_DATABASE', 'product_db'),
-        'USER': os.environ.get('MYSQL_USER', 'root'),
-        'PASSWORD': os.environ.get('MYSQL_PASSWORD', 'rootpassword'),
-        'HOST': os.environ.get('MYSQL_HOST', 'localhost'),
-        'PORT': '3306',
+# Detect if we are running tests (Django test runner or pytest)
+TESTING = 'test' in sys.argv or any('pytest' in arg for arg in sys.argv)
+
+if TESTING:
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
+        }
     }
-}
+else:
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.mysql',
+            'NAME': os.environ.get('MYSQL_DATABASE', 'product_db'),
+            'USER': os.environ.get('MYSQL_USER', 'root'),
+            'PASSWORD': os.environ.get('MYSQL_PASSWORD', 'rootpassword'),
+            'HOST': os.environ.get('MYSQL_HOST', 'localhost'),
+            'PORT': '3306',
+        }
+    }
 
 
 # Password validation
